@@ -4,6 +4,7 @@ from typing import List, Dict, Any
 import pandas as pd
 import numpy as np
 import traceback
+import json
 from datetime import date, datetime
 
 from models.prophet_model import train_prophet_model, predict_with_prophet
@@ -38,17 +39,85 @@ def read_root():
 async def forecast_with_prophet_xgboost(request: ForecastRequest):
     try:
         print("📥 forecast_with_prophet_xgboost 호출됨")
+        
+        # 원본 API 파라미터 로그 출력
+        print("📊 원본 입력 데이터:")
+        
+        # historicalData 로그 출력
+        print(f"📈 과거 데이터 샘플 (총 {len(request.historicalData)}개):")
+        if len(request.historicalData) > 0:
+            # 첫 번째와 마지막 레코드 출력
+            print(f"첫 번째 레코드: {json.dumps(request.historicalData[0], ensure_ascii=False, default=str)}")
+            print(f"마지막 레코드: {json.dumps(request.historicalData[-1], ensure_ascii=False, default=str)}")
+            
+            # 모든 키 목록 (어떤 특성이 포함되어 있는지 확인)
+            all_keys = set()
+            for item in request.historicalData:
+                all_keys.update(item.keys())
+            print(f"과거 데이터 포함 특성: {sorted(list(all_keys))}")
+        
+        # futureDates 로그 출력
+        print(f"🔮 예측 데이터 샘플 (총 {len(request.futureDates)}개):")
+        if len(request.futureDates) > 0:
+            # 첫 번째와 마지막 레코드 출력
+            print(f"첫 번째 레코드: {json.dumps(request.futureDates[0], ensure_ascii=False, default=str)}")
+            print(f"마지막 레코드: {json.dumps(request.futureDates[-1], ensure_ascii=False, default=str)}")
+            
+            # 모든 키 목록 (어떤 특성이 포함되어 있는지 확인)
+            all_keys = set()
+            for item in request.futureDates:
+                all_keys.update(item.keys())
+            print(f"예측 데이터 포함 특성: {sorted(list(all_keys))}")
 
-        # 1. 데이터 준비
+        # 1. 방학 데이터 제외 처리
+        modified_historical_data = []
+        for item in request.historicalData:
+            new_item = {k: v for k, v in item.items() if k != 'isSchoolVacation' and k != 'vacationType'}
+            modified_historical_data.append(new_item)
+            
+        modified_future_dates = []
+        for item in request.futureDates:
+            new_item = {k: v for k, v in item.items() if k != 'isSchoolVacation' and k != 'vacationType'}
+            modified_future_dates.append(new_item)
+
+        # 데이터 준비
         historical_df, future_df, feature_cols = prepare_data(
-            request.historicalData, request.futureDates
+            modified_historical_data, modified_future_dates
         )
+        
+        # 변환된 DataFrame 로그 출력
+        print("📊 변환된 DataFrame 정보:")
+        print("-- 과거 데이터 컬럼:")
+        print(historical_df.columns.tolist())
+        print("-- 예측 데이터 컬럼:")
+        print(future_df.columns.tolist())
+        
+        # 과거 데이터의 처음 3개 행과 마지막 3개 행 출력
+        print("-- 과거 데이터 샘플:")
+        if len(historical_df) > 6:
+            print("처음 3개 행:")
+            print(historical_df.head(3).to_string())
+            print("마지막 3개 행:")
+            print(historical_df.tail(3).to_string())
+        else:
+            print(historical_df.to_string())
+        
+        # 예측 데이터의 처음 3개 행과 마지막 3개 행 출력
+        print("-- 예측 데이터 샘플:")
+        if len(future_df) > 6:
+            print("처음 3개 행:")
+            print(future_df.head(3).to_string())
+            print("마지막 3개 행:")
+            print(future_df.tail(3).to_string())
+        else:
+            print(future_df.to_string())
+            
         print("✅ 데이터 준비 완료")
 
         # 2. Prophet 모델 학습 및 예측
         prophet_model = train_prophet_model(historical_df)
         prophet_historical_pred, prophet_future_pred = predict_with_prophet(
-            prophet_model, historical_df[['ds']], future_df[['ds']]
+            prophet_model, historical_df, future_df
         )
         print("✅ Prophet 예측 완료")
 
@@ -76,6 +145,11 @@ async def forecast_with_prophet_xgboost(request: ForecastRequest):
         future_df['lower_bound'] = prophet_future_pred['yhat_lower'] + future_df['residual_pred']
         future_df['upper_bound'] = prophet_future_pred['yhat_upper'] + future_df['residual_pred']
         future_df['lower_bound'] = future_df['lower_bound'].clip(lower=0)
+        
+        # 최종 예측 결과 로그 출력
+        print("📊 최종 예측 결과:")
+        result_cols = ['ds', 'prophet_pred', 'residual_pred', 'final_pred', 'crowd_level']
+        print(future_df[result_cols].head(10).to_string())
 
         # 8. 응답 준비
         predictions = []
@@ -106,7 +180,7 @@ async def forecast_with_prophet_xgboost(request: ForecastRequest):
             }
 
             # 추가 특성 포함
-            for col in ['isWeekend', 'isHoliday', 'isSchoolVacation', 'temperature']:
+            for col in ['isWeekend', 'isHoliday', 'temperature']:
                 if col in row:
                     val = row[col]
                     if isinstance(val, (np.integer, np.floating, np.bool_)):
@@ -165,25 +239,42 @@ def generate_prediction_comment(date, row, prophet_comp, historical_df, top_feat
     day_type = "주말" if is_weekend else "평일"
     comment += f"- 해당 일자는 {day_name}({day_type})입니다.\n"
 
-    # 2. 특별 일자 (공휴일, 방학 등)
+    # 2. 특별 일자 (공휴일)
     is_holiday = int(row.get('isHoliday', 0)) == 1
-    is_vacation = int(row.get('isSchoolVacation', 0)) == 1
 
     if is_holiday:
         holiday_name = row.get('holidayName', '공휴일')
         comment += f"- 이 날은 {holiday_name}입니다.\n"
 
-    if is_vacation:
-        vacation_type = row.get('vacationType', '방학')
-        comment += f"- 이 날은 {vacation_type} 기간입니다.\n"
-
     # 3. 날씨 정보
+    weather_comment = []
+
+    # 기온
     if 'temperature' in row and row['temperature'] is not None:
         temp = float(row['temperature'])
-        comment += f"- 예상 기온은 {temp:.1f}°C입니다.\n"
+        weather_comment.append(f"기온은 {temp:.1f}°C")
 
+    # 습도
+    if 'humidity' in row and row['humidity'] is not None:
+        humidity = float(row['humidity'])
+        weather_comment.append(f"습도는 {humidity:.1f}%")
+
+    # 강수량/적설량 정보
+    precip_info = []
     if 'isRainy' in row and int(row.get('isRainy', 0)) == 1:
-        comment += f"- 이 날은 비 예보가 있어 방문객 수에 영향을 줄 수 있습니다.\n"
+        precip_val = f"{float(row.get('precipitation', 0)):.1f}mm" if 'precipitation' in row else "있음"
+        precip_info.append(f"강수량 {precip_val}")
+
+    if 'isSnow' in row and int(row.get('isSnow', 0)) == 1:
+        snow_val = f"{float(row.get('snowfall', 0)):.1f}cm" if 'snowfall' in row else "있음"
+        precip_info.append(f"적설량 {snow_val}")
+
+    if precip_info:
+        weather_comment.append("강수 예보(" + ", ".join(precip_info) + ")")
+
+    # 날씨 정보 합치기
+    if weather_comment:
+        comment += f"- 날씨 조건: {', '.join(weather_comment)}입니다. 이는 방문객 수에 영향을 줄 수 있습니다.\n"
 
     # 4. 과거 유사 일자 찾기
     similar_dates = find_similar_dates(date, historical_df)
@@ -216,14 +307,30 @@ def generate_prediction_comment(date, row, prophet_comp, historical_df, top_feat
             feature_name = {
                 'isWeekend': '주말 여부',
                 'isHoliday': '공휴일 여부',
-                'isSchoolVacation': '방학 여부',
                 'temperature': '기온',
+                'humidity': '습도',
+                'precipitation': '강수량',
+                'snowfall': '적설량',
+                'isRainy': '강수 여부',
+                'isSnow': '눈 여부',
                 'dayOfWeek': '요일',
-                'month': '월',
-                'isRainy': '강수 여부'
+                'month': '월'
             }.get(feature, feature)
 
-            comment += f"  * {feature_name}: {feature_value} (중요도: {importance:.4f})\n"
+            # 특성 값 포맷팅
+            if feature in ['temperature', 'precipitation', 'humidity', 'snowfall']:
+                feature_display = f"{float(feature_value):.1f}"
+                # 단위 추가
+                if feature == 'temperature': feature_display += "°C"
+                elif feature == 'precipitation': feature_display += "mm"
+                elif feature == 'humidity': feature_display += "%"
+                elif feature == 'snowfall': feature_display += "cm"
+            elif feature in ['isRainy', 'isSnow', 'isWeekend', 'isHoliday']:
+                feature_display = "예" if int(feature_value) == 1 else "아니오"
+            else:
+                feature_display = str(feature_value)
+
+            comment += f"  * {feature_name}: {feature_display} (중요도: {importance:.4f})\n"
 
     # 6. 최종 예측 결과
     density = float(row['final_pred'])

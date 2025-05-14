@@ -1,0 +1,4 @@
+1. 아나콘다 프롬프트 실행
+2. conda activate crowd_forecast
+3. cd C:\jamless_ml\jamless_ml
+4. uvicorn app:app --host 0.0.0.0 --port 8000 --reload
